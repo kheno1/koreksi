@@ -1,7 +1,9 @@
-gunicorn
-flask
-flask-cors
-groq
-opencv-python-headless
-numpy
-pillow
+flask==3.0.3
+flask-cors==4.0.1
+flask-limiter==3.7.0
+gunicorn==22.0.0
+groq==0.9.0
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pillow==10.4.0
+python-dotenv==1.0.1
