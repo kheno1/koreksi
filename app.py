@@ -1,347 +1,350 @@
 import os
-import cv2
-import numpy as np
+import re
 import json
+import logging
+import numpy as np
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
+from PIL import Image
+import cv2
+import io
+import base64
+
+# ─── Setup ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
 
-# ── Groq Client ────────────────────────────────────────────────────────────────
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 1: OMR - Pilihan Ganda (existing)
-# ══════════════════════════════════════════════════════════════════════════════
-@app.route('/api/scan', methods=['POST'])
-def scan_omr():
-    """Proses lembar jawaban OMR untuk soal pilihan ganda."""
-    try:
-        if 'image' not in request.files:
-            return jsonify({"error": "No image provided"}), 400
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["60 per minute"],
+    storage_uri="memory://"
+)
 
-        file       = request.files['image']
-        answer_key = json.loads(request.form.get('answer_key', '[]'))
-        num_q      = int(request.form.get('num_questions', len(answer_key)))
+# ─── Groq Client ──────────────────────────────────────────────────────────────
 
-        # Baca gambar
-        img_bytes = file.read()
-        nparr     = np.frombuffer(img_bytes, np.uint8)
-        img       = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+groq_client = Groq(
+    api_key=os.environ.get("GROQ_API_KEY")
+)
 
-        if img is None:
-            return jsonify({"error": "Invalid image"}), 400
+# ─── Health Check ─────────────────────────────────────────────────────────────
 
-        # Proses OMR
-        detected = process_omr(img, num_q)
-
-        # Hitung skor
-        score, details = calculate_score(detected, answer_key)
-
-        return jsonify({
-            "success"  : True,
-            "detected" : detected,
-            "score"    : score,
-            "details"  : details,
-            "total"    : num_q
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 2: AI Grade - Isian Singkat & Esai (NEW)
-# ══════════════════════════════════════════════════════════════════════════════
-@app.route('/api/grade-text', methods=['POST'])
-def grade_text():
-    """
-    Koreksi isian singkat dan esai menggunakan Groq LLaMA 3.3.
-    
-    Request body:
-    {
-        "items": [
-            {
-                "id"            : "q1",
-                "type"          : "isian" | "esai",
-                "question"      : "Apa ibukota Indonesia?",
-                "answer_key"    : "Jakarta",
-                "student_answer": "jakarta",
-                "max_score"     : 10
-            }
-        ],
-        "student_name"  : "Budi Santoso",
-        "subject"       : "IPS"
-    }
-    """
-    try:
-        data         = request.json
-        items        = data.get('items', [])
-        student_name = data.get('student_name', 'Siswa')
-        subject      = data.get('subject', 'Umum')
-
-        if not items:
-            return jsonify({"error": "No items provided"}), 400
-
-        results = []
-
-        for item in items:
-            item_type   = item.get('type', 'isian')
-            question    = item.get('question', '')
-            answer_key  = item.get('answer_key', '')
-            student_ans = item.get('student_answer', '')
-            max_score   = item.get('max_score', 10)
-            item_id     = item.get('id', '')
-
-            # Lewati jika jawaban kosong
-            if not student_ans.strip():
-                results.append({
-                    "id"      : item_id,
-                    "skor"    : 0,
-                    "max"     : max_score,
-                    "status"  : "tidak dijawab",
-                    "feedback": "Siswa tidak memberikan jawaban."
-                })
-                continue
-
-            # Bangun prompt berdasarkan tipe soal
-            prompt = build_prompt(
-                item_type, question, answer_key,
-                student_ans, max_score, subject
-            )
-
-            # Panggil Groq API
-            ai_result = call_groq(prompt)
-
-            # Normalisasi skor ke max_score
-            if ai_result.get('skor') is not None:
-                normalized = round(
-                    (ai_result['skor'] / 100) * max_score, 1
-                )
-                ai_result['skor']     = normalized
-                ai_result['max']      = max_score
-                ai_result['id']       = item_id
-                ai_result['raw_pct']  = ai_result.get('skor_persen', 0)
-
-            results.append(ai_result)
-
-        # Hitung total skor isian/esai
-        total_earned = sum(r.get('skor', 0) for r in results)
-        total_max    = sum(item.get('max_score', 10) for item in items)
-
-        return jsonify({
-            "success"        : True,
-            "student_name"   : student_name,
-            "results"        : results,
-            "total_earned"   : total_earned,
-            "total_max"      : total_max,
-            "percentage"     : round((total_earned / total_max * 100), 1) if total_max > 0 else 0
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e), "success": False}), 500
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 3: Health Check
-# ══════════════════════════════════════════════════════════════════════════════
-@app.route('/api/health', methods=['GET'])
+@app.route("/", methods=["GET"])
 def health():
-    groq_status = "ok"
-    try:
-        # Test koneksi Groq ringan
-        groq_client.models.list()
-    except Exception:
-        groq_status = "error"
-
     return jsonify({
-        "status"    : "ok",
-        "groq"      : groq_status,
-        "model"     : "llama-3.3-70b-versatile"
-    })
+        "status": "ok",
+        "service": "SmartGrade API",
+        "version": "2.0.0",
+        "endpoints": ["/api/scan", "/api/grade-text", "/api/health"]
+    }), 200
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
-def build_prompt(item_type, question, answer_key, student_ans, max_score, subject):
-    """Bangun prompt yang sesuai untuk setiap tipe soal."""
-
-    base_context = f"""Kamu adalah guru {subject} yang berpengalaman dan sedang mengoreksi ulangan siswa.
-Berikan penilaian yang adil, objektif, dan konstruktif dalam Bahasa Indonesia.
-PENTING: Jawab HANYA dengan format JSON yang valid, tanpa teks tambahan di luar JSON."""
-
-    if item_type == 'isian':
-        return f"""{base_context}
-
-Tipe Soal: Isian Singkat
-Pertanyaan: {question}
-Kunci Jawaban: {answer_key}
-Jawaban Siswa: {student_ans}
-
-Koreksi jawaban siswa. Pertimbangkan sinonim, ejaan berbeda, dan jawaban yang secara makna sama.
-
-Kembalikan JSON dengan format TEPAT ini:
-{{
-  "skor_persen": <angka 0-100>,
-  "status": "<benar|sebagian benar|salah>",
-  "feedback": "<komentar singkat 1-2 kalimat>"
-}}"""
-
-    else:  # esai
-        return f"""{base_context}
-
-Tipe Soal: Esai
-Pertanyaan: {question}
-Panduan Jawaban / Kunci: {answer_key}
-Jawaban Siswa: {student_ans}
-Skor Maksimal: {max_score}
-
-Nilai esai berdasarkan 4 aspek:
-1. Relevansi (kesesuaian dengan pertanyaan)
-2. Kelengkapan (mencakup poin-poin penting)
-3. Pemahaman konsep (kedalaman analisis)
-4. Bahasa (kejelasan dan tata bahasa)
-
-Kembalikan JSON dengan format TEPAT ini:
-{{
-  "skor_persen": <angka 0-100>,
-  "status": "<sangat baik|baik|cukup|kurang>",
-  "aspek": {{
-    "relevansi"  : <0-25>,
-    "kelengkapan": <0-25>,
-    "pemahaman"  : <0-25>,
-    "bahasa"     : <0-25>
-  }},
-  "feedback": "<komentar konstruktif 2-3 kalimat untuk siswa>"
-}}"""
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    groq_status = "ok" if os.environ.get("GROQ_API_KEY") else "missing"
+    return jsonify({
+        "status": "ok",
+        "groq": groq_status
+    }), 200
 
 
-def call_groq(prompt: str) -> dict:
-    """Panggil Groq API dengan LLaMA 3.3 dan parse hasilnya."""
-    try:
-        response = groq_client.chat.completions.create(
-            model       = "llama-3.3-70b-versatile",
-            messages    = [{"role": "user", "content": prompt}],
-            temperature = 0.2,   # Rendah agar konsisten
-            max_tokens  = 512,
-            # Paksa output JSON
-            response_format={"type": "json_object"}
-        )
+# ─── OMR Scan (Pilihan Ganda) ──────────────────────────────────────────────────
 
-        raw_text = response.choices[0].message.content.strip()
-        result   = json.loads(raw_text)
-
-        # Normalisasi key
-        return {
-            "skor"       : result.get("skor_persen", 0),
-            "skor_persen": result.get("skor_persen", 0),
-            "status"     : result.get("status", "tidak diketahui"),
-            "feedback"   : result.get("feedback", ""),
-            "aspek"      : result.get("aspek", {})
-        }
-
-    except json.JSONDecodeError:
-        # Fallback: coba ekstrak JSON dari teks
-        return extract_json_fallback(raw_text)
-    except Exception as e:
-        return {
-            "skor"    : 0,
-            "status"  : "error",
-            "feedback": f"Gagal memproses dengan AI: {str(e)}"
-        }
+def preprocess_image(image_bytes):
+    """Konversi bytes ke grayscale numpy array untuk OpenCV."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_array = np.array(image)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    return gray
 
 
-def extract_json_fallback(text: str) -> dict:
-    """Ekstrak JSON dari respons teks jika parsing langsung gagal."""
-    import re
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except Exception:
-            pass
-    return {"skor": 0, "status": "error", "feedback": "Format respons AI tidak valid."}
-
-
-def process_omr(img, num_questions: int) -> list:
-    """Proses gambar OMR dan deteksi bubble yang diisi."""
-    gray      = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred   = cv2.GaussianBlur(gray, (5, 5), 0)
+def detect_bubbles(gray_img, num_questions, num_choices):
+    """
+    Deteksi bubble yang diarsir pada lembar jawaban.
+    Mengembalikan dict {nomor_soal: jawaban_huruf}
+    """
+    blurred = cv2.GaussianBlur(gray_img, (5, 5), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Filter contour berbentuk lingkaran
     bubbles = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 500 < area < 5000:
+        if area < 200 or area > 5000:
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * np.pi * (area / (perimeter ** 2))
+        if circularity > 0.7:
             x, y, w, h = cv2.boundingRect(cnt)
-            aspect     = w / float(h)
-            if 0.7 < aspect < 1.3:
-                bubbles.append((x, y, w, h, cnt))
+            bubbles.append((x, y, w, h, cnt))
 
-    # Sort berdasarkan posisi Y (baris) lalu X (kolom)
+    if not bubbles:
+        return {}
+
+    # Urutkan bubble berdasarkan posisi Y (baris = soal), X (kolom = pilihan)
     bubbles.sort(key=lambda b: (b[1] // 30, b[0]))
 
-    detected  = []
-    options   = ['A', 'B', 'C', 'D', 'E']
-    num_opts  = 4  # Default 4 pilihan
+    choices = "ABCDE"
+    answers = {}
+    row_groups = {}
 
-    for q_idx in range(num_questions):
-        start   = q_idx * num_opts
-        end     = start + num_opts
-        row     = bubbles[start:end]
+    for (x, y, w, h, cnt) in bubbles:
+        row_key = y // 30
+        if row_key not in row_groups:
+            row_groups[row_key] = []
+        row_groups[row_key].append((x, y, w, h, cnt))
 
-        if not row:
-            detected.append(None)
-            continue
+    sorted_rows = sorted(row_groups.keys())
 
-        # Cari bubble dengan density tertinggi (paling gelap = diisi)
-        best_density = -1
-        best_opt     = None
+    for q_idx, row_key in enumerate(sorted_rows[:num_questions]):
+        row_bubbles = sorted(row_groups[row_key], key=lambda b: b[0])
+        max_fill = -1
+        best_choice = None
 
-        for opt_idx, bubble in enumerate(row):
-            x, y, w, h, cnt = bubble
-            mask             = np.zeros(thresh.shape, dtype=np.uint8)
+        for c_idx, (x, y, w, h, cnt) in enumerate(row_bubbles[:num_choices]):
+            mask = np.zeros(gray_img.shape, dtype=np.uint8)
             cv2.drawContours(mask, [cnt], -1, 255, -1)
-            filled   = cv2.countNonZero(cv2.bitwise_and(thresh, thresh, mask=mask))
-            density  = filled / cv2.contourArea(cnt) if cv2.contourArea(cnt) > 0 else 0
+            mean_val = cv2.mean(gray_img, mask=mask)[0]
+            fill = 255 - mean_val  # semakin gelap = semakin terisi
 
-            if density > best_density:
-                best_density = density
-                best_opt     = options[opt_idx] if opt_idx < len(options) else str(opt_idx + 1)
+            if fill > max_fill:
+                max_fill = fill
+                best_choice = choices[c_idx] if c_idx < len(choices) else str(c_idx + 1)
 
-        detected.append(best_opt if best_density > 0.5 else None)
+        if best_choice and max_fill > 50:
+            answers[q_idx + 1] = best_choice
 
-    return detected
-
-
-def calculate_score(detected: list, answer_key: list) -> tuple:
-    """Hitung skor berdasarkan jawaban terdeteksi vs kunci jawaban."""
-    correct = 0
-    details = []
-
-    for i, (det, key) in enumerate(zip(detected, answer_key)):
-        is_correct = str(det).upper() == str(key).upper() if det else False
-        if is_correct:
-            correct += 1
-        details.append({
-            "no"        : i + 1,
-            "detected"  : det,
-            "key"       : key,
-            "correct"   : is_correct
-        })
-
-    total = len(answer_key)
-    score = round((correct / total * 100), 1) if total > 0 else 0
-
-    return score, details
+    return answers
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-if __name__ == '__main__':
+@app.route("/api/scan", methods=["POST"])
+@limiter.limit("30 per minute")
+def scan():
+    """
+    Endpoint OMR untuk koreksi pilihan ganda.
+    Menerima: image (file), answer_key (JSON string), num_choices (int)
+    """
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "File gambar tidak ditemukan"}), 400
+
+        image_file = request.files["image"]
+        answer_key_raw = request.form.get("answer_key", "{}")
+        num_choices = int(request.form.get("num_choices", 5))
+
+        # Parse kunci jawaban
+        try:
+            answer_key = json.loads(answer_key_raw)
+            # Normalisasi key ke integer
+            answer_key = {int(k): v.upper().strip() for k, v in answer_key.items()}
+        except (json.JSONDecodeError, ValueError) as e:
+            return jsonify({"error": f"Format kunci jawaban tidak valid: {str(e)}"}), 400
+
+        image_bytes = image_file.read()
+        gray_img = preprocess_image(image_bytes)
+
+        num_questions = len(answer_key)
+        student_answers = detect_bubbles(gray_img, num_questions, num_choices)
+
+        # Hitung skor
+        results = {}
+        correct = 0
+
+        for q_num, correct_ans in answer_key.items():
+            student_ans = student_answers.get(q_num, "-")
+            is_correct = student_ans == correct_ans
+            if is_correct:
+                correct += 1
+            results[q_num] = {
+                "kunci": correct_ans,
+                "jawaban": student_ans,
+                "benar": is_correct
+            }
+
+        total = len(answer_key)
+        score = round((correct / total) * 100, 2) if total > 0 else 0
+
+        logger.info(f"OMR scan selesai: {correct}/{total} benar, skor={score}")
+
+        return jsonify({
+            "status": "success",
+            "skor": score,
+            "benar": correct,
+            "total": total,
+            "detail": results
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error di /api/scan: {str(e)}", exc_info=True)
+        return jsonify({"error": "Terjadi kesalahan saat memproses gambar"}), 500
+
+
+# ─── AI Grading (Isian & Esai) ────────────────────────────────────────────────
+
+def build_prompt(question, answer_key, student_answer, item_type, max_score):
+    """Buat prompt terstruktur untuk Groq LLaMA 3.3."""
+
+    if item_type == "isian":
+        return f"""Kamu adalah guru profesional yang mengoreksi jawaban isian singkat siswa sekolah Indonesia.
+
+Pertanyaan: {question}
+Kunci Jawaban: {answer_key}
+Jawaban Siswa: {student_answer}
+Skor Maksimal: {max_score}
+
+Instruksi:
+- Bandingkan jawaban siswa dengan kunci jawaban secara SEMANTIK (makna), bukan hanya pencocokan kata
+- Jawaban yang memiliki makna sama atau setara dengan kunci jawaban dianggap BENAR
+- Berikan skor antara 0 sampai {max_score}
+- Berikan komentar singkat dalam Bahasa Indonesia
+
+Kembalikan HANYA JSON valid ini (tanpa teks lain):
+{{"skor": <angka>, "status": "<benar|sebagian benar|salah>", "komentar": "<komentar singkat>"}}"""
+
+    else:  # esai
+        return f"""Kamu adalah guru profesional yang menilai esai siswa sekolah Indonesia.
+
+Pertanyaan: {question}
+Panduan Jawaban / Kunci: {answer_key}
+Jawaban Siswa: {student_answer}
+Skor Maksimal: {max_score}
+
+Kriteria Penilaian:
+1. Relevansi isi dengan pertanyaan (30%)
+2. Kelengkapan dan kedalaman jawaban (30%)
+3. Pemahaman konsep (25%)
+4. Tata bahasa dan struktur kalimat (15%)
+
+Instruksi:
+- Nilai secara objektif dan konstruktif
+- Berikan feedback yang membantu siswa berkembang
+- Gunakan Bahasa Indonesia yang ramah namun profesional
+
+Kembalikan HANYA JSON valid ini (tanpa teks lain):
+{{"skor": <angka>, "aspek": {{"relevansi": <0-30>, "kelengkapan": <0-30>, "pemahaman": <0-25>, "bahasa": <0-15>}}, "feedback": "<feedback konstruktif 2-3 kalimat>"}}"""
+
+
+def extract_json_from_response(text):
+    """Ekstrak JSON dari respons AI meskipun ada teks tambahan."""
+    text = text.strip()
+
+    # Coba parse langsung
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Cari blok JSON dalam teks
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+@app.route("/api/grade-text", methods=["POST"])
+@limiter.limit("10 per minute")
+def grade_text():
+    """
+    Endpoint AI untuk koreksi isian singkat dan esai.
+    Menerima: question, answer_key, student_answer, type, max_score
+    """
+    try:
+        data = request.get_json(force=True)
+
+        if not data:
+            return jsonify({"error": "Body request tidak valid"}), 400
+
+        question = data.get("question", "").strip()
+        answer_key = data.get("answer_key", "").strip()
+        student_answer = data.get("student_answer", "").strip()
+        item_type = data.get("type", "isian").strip().lower()
+        max_score = int(data.get("max_score", 100))
+
+        # Validasi input
+        if not question:
+            return jsonify({"error": "Pertanyaan tidak boleh kosong"}), 400
+        if not answer_key:
+            return jsonify({"error": "Kunci jawaban tidak boleh kosong"}), 400
+        if not student_answer:
+            return jsonify({
+                "skor": 0,
+                "status": "tidak dijawab",
+                "komentar": "Siswa tidak memberikan jawaban.",
+                "feedback": "Siswa tidak memberikan jawaban."
+            }), 200
+        if item_type not in ["isian", "esai"]:
+            return jsonify({"error": "Tipe harus 'isian' atau 'esai'"}), 400
+
+        prompt = build_prompt(question, answer_key, student_answer, item_type, max_score)
+
+        logger.info(f"Groq grading: type={item_type}, max_score={max_score}")
+
+        # Panggil Groq API
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Kamu adalah sistem penilaian otomatis. Selalu kembalikan respons dalam format JSON valid tanpa teks tambahan apapun."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.2,
+            max_tokens=512,
+        )
+
+        raw_response = chat_completion.choices[0].message.content
+        logger.info(f"Groq raw response: {raw_response[:200]}")
+
+        result = extract_json_from_response(raw_response)
+
+        if not result:
+            logger.error(f"Gagal parse JSON dari Groq: {raw_response}")
+            return jsonify({"error": "AI mengembalikan format tidak valid, coba lagi"}), 500
+
+        # Normalisasi skor
+        ai_score = result.get("skor", 0)
+        normalized_score = min(max(float(ai_score), 0), max_score)
+        result["skor"] = round(normalized_score, 1)
+        result["max_score"] = max_score
+
+        logger.info(f"Grading selesai: skor={result['skor']}/{max_score}")
+
+        return jsonify({
+            "status": "success",
+            **result
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error di /api/grade-text: {str(e)}", exc_info=True)
+        return jsonify({"error": "Terjadi kesalahan saat koreksi AI"}), 500
+
+
+# ─── Run ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
