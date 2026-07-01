@@ -1,338 +1,407 @@
 import os
-import re
-import json
 import base64
-import logging
-import numpy as np
-
+import json
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from groq import Groq
-from PIL import Image
-import cv2
-import io
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# ── App Init ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-CORS(app, resources={
-    r"/api/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+CORS(app)
 
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["60 per minute"],
-    storage_uri="memory://"
+    default_limits=["60 per minute"]
 )
 
-# ── Groq Client ───────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# ─────────────────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────────────────
+@app.route("/")
+def index():
+    return jsonify({"status": "SmartGrade API is running", "version": "2.0"})
 
 
-# ── Health Check ─────────────────────────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "ok",
-        "service": "SmartGrade AI Backend",
-        "groq_ready": groq_client is not None
-    }), 200
+# ─────────────────────────────────────────
+# EXTRACT ANSWERS FROM IMAGE (Vision AI)
+# ─────────────────────────────────────────
+@app.route("/api/extract-answers", methods=["POST"])
+@limiter.limit("30 per minute")
+def extract_answers():
+    """
+    Menerima gambar scan lembar jawaban siswa,
+    AI membaca dan mengekstrak semua jawaban secara otomatis.
+    """
+    data = request.get_json()
+    
+    if not data or "image" not in data:
+        return jsonify({"error": "Image data required"}), 400
+    
+    mode = data.get("mode", "pg")  # pg | pg_isian | pg_isian_essay
+    image_base64 = data.get("image", "")
+    
+    # Bersihkan prefix base64 jika ada
+    if "," in image_base64:
+        image_base64 = image_base64.split(",")[1]
+    
+    # Buat prompt sesuai mode
+    if mode == "pg":
+        extraction_prompt = """
+Kamu adalah sistem OCR untuk lembar jawaban ujian sekolah Indonesia.
 
+Baca gambar lembar jawaban siswa ini dengan SANGAT TELITI.
 
-@app.route("/api/health", methods=["GET"])
-def api_health():
-    return jsonify({
-        "status": "ok",
-        "groq_ready": groq_client is not None
-    }), 200
+Ekstrak semua jawaban pilihan ganda siswa.
+Format output HARUS berupa JSON valid seperti ini:
+{
+  "nama_siswa": "nama jika tertulis, atau null",
+  "kelas": "kelas jika tertulis, atau null", 
+  "pilihan_ganda": {
+    "1": "A",
+    "2": "C",
+    "3": "B",
+    "4": "D",
+    "5": "A"
+  },
+  "total_soal_terdeteksi": 5,
+  "catatan": "catatan jika ada jawaban yang tidak terbaca jelas"
+}
 
+Aturan:
+- Jawaban PG hanya boleh A, B, C, D, atau E
+- Jika tidak terbaca tulis "?"
+- Hanya output JSON, tidak ada teks lain
+"""
 
-# ── OMR Scan Endpoint ─────────────────────────────────────────────────────────
-@app.route("/api/scan", methods=["POST"])
-@limiter.limit("10 per minute")
-def scan_omr():
+    elif mode == "pg_isian":
+        extraction_prompt = """
+Kamu adalah sistem OCR untuk lembar jawaban ujian sekolah Indonesia.
+
+Baca gambar lembar jawaban siswa ini dengan SANGAT TELITI.
+
+Ekstrak semua jawaban pilihan ganda DAN isian singkat siswa.
+Format output HARUS berupa JSON valid seperti ini:
+{
+  "nama_siswa": "nama jika tertulis, atau null",
+  "kelas": "kelas jika tertulis, atau null",
+  "pilihan_ganda": {
+    "1": "A",
+    "2": "C"
+  },
+  "isian_singkat": {
+    "1": "jawaban siswa untuk isian 1",
+    "2": "jawaban siswa untuk isian 2"
+  },
+  "total_pg_terdeteksi": 2,
+  "total_isian_terdeteksi": 2,
+  "catatan": "catatan jika ada tulisan tidak terbaca"
+}
+
+Aturan:
+- Jawaban PG hanya A, B, C, D, atau E
+- Isian: tulis persis apa yang ditulis siswa
+- Jika tidak terbaca tulis "?"
+- Hanya output JSON, tidak ada teks lain
+"""
+
+    else:  # pg_isian_essay
+        extraction_prompt = """
+Kamu adalah sistem OCR untuk lembar jawaban ujian sekolah Indonesia.
+
+Baca gambar lembar jawaban siswa ini dengan SANGAT TELITI dan LENGKAP.
+
+Ekstrak semua jawaban: pilihan ganda, isian singkat, DAN esai panjang.
+Format output HARUS berupa JSON valid seperti ini:
+{
+  "nama_siswa": "nama jika tertulis, atau null",
+  "kelas": "kelas jika tertulis, atau null",
+  "pilihan_ganda": {
+    "1": "A",
+    "2": "C"
+  },
+  "isian_singkat": {
+    "1": "jawaban isian 1",
+    "2": "jawaban isian 2"
+  },
+  "essay": {
+    "1": "Teks lengkap esai siswa nomor 1 ditulis selengkap mungkin sesuai yang tertulis di kertas",
+    "2": "Teks lengkap esai siswa nomor 2"
+  },
+  "total_pg_terdeteksi": 2,
+  "total_isian_terdeteksi": 2,
+  "total_essay_terdeteksi": 2,
+  "catatan": "catatan jika ada tulisan tidak terbaca atau gambar kurang jelas"
+}
+
+Aturan PENTING:
+- Jawaban PG hanya A, B, C, D, atau E
+- Isian: tulis persis apa yang ditulis siswa
+- Esai: tulis SELENGKAP mungkin, jangan potong
+- Jika tidak terbaca tulis "?"
+- Hanya output JSON, tidak ada teks lain
+"""
+
     try:
-        data = request.get_json(force=True)
-
-        if not data or "image" not in data:
-            return jsonify({"error": "Field 'image' wajib diisi (base64)"}), 400
-
-        answer_key = data.get("answer_key", [])
-        if not answer_key:
-            return jsonify({"error": "Field 'answer_key' wajib diisi"}), 400
-
-        # Decode base64 image
-        image_data = data["image"]
-        if "," in image_data:
-            image_data = image_data.split(",")[1]
-
-        img_bytes = base64.b64decode(image_data)
-        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-        if img is None:
-            return jsonify({"error": "Gagal memproses gambar"}), 400
-
-        # Preprocessing
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(
-            blurred, 0, 255,
-            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-
-        # Deteksi lingkaran
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=20,
-            param1=50,
-            param2=30,
-            minRadius=10,
-            maxRadius=30
-        )
-
-        detected_answers = []
-        score = 0
-        total = len(answer_key)
-
-        if circles is not None:
-            circles = np.round(circles[0, :]).astype("int")
-            for i, key in enumerate(answer_key):
-                detected_answers.append({
-                    "no": i + 1,
-                    "kunci": key,
-                    "jawaban": "A",   # placeholder — sesuaikan dengan logika OMR
-                    "benar": False
-                })
-        else:
-            detected_answers = [
-                {
-                    "no": i + 1,
-                    "kunci": key,
-                    "jawaban": "-",
-                    "benar": False
-                }
-                for i, key in enumerate(answer_key)
-            ]
-
-        return jsonify({
-            "success": True,
-            "total_soal": total,
-            "skor": score,
-            "nilai": round((score / total) * 100, 2) if total > 0 else 0,
-            "detail": detected_answers
-        }), 200
-
-    except Exception as e:
-        logger.error(f"[scan_omr] Error: {e}")
-        return jsonify({"error": "Gagal memproses scan OMR", "detail": str(e)}), 500
-
-
-# ── AI Grading Endpoint ───────────────────────────────────────────────────────
-@app.route("/api/grade-text", methods=["POST"])
-@limiter.limit("5 per minute")
-def grade_text():
-    try:
-        if not groq_client:
-            return jsonify({"error": "GROQ_API_KEY belum dikonfigurasi"}), 503
-
-        data = request.get_json(force=True)
-
-        if not data:
-            return jsonify({"error": "Request body kosong"}), 400
-
-        required_fields = ["question", "student_answer", "reference_answer"]
-        for field in required_fields:
-            if field not in data:
-                return jsonify({"error": f"Field '{field}' wajib diisi"}), 400
-
-        question         = str(data["question"]).strip()
-        student_answer   = str(data["student_answer"]).strip()
-        reference_answer = str(data["reference_answer"]).strip()
-        max_score        = int(data.get("max_score", 10))
-        question_type    = str(data.get("type", "essay"))
-
-        if not student_answer:
-            return jsonify({
-                "success": True,
-                "score": 0,
-                "max_score": max_score,
-                "percentage": 0,
-                "feedback": "Jawaban kosong.",
-                "criteria": {}
-            }), 200
-
-        # System prompt
-        system_prompt = f"""Kamu adalah asisten penilaian otomatis untuk guru.
-Nilailah jawaban siswa secara objektif berdasarkan kunci jawaban.
-
-Tipe soal: {question_type}
-Skor maksimal: {max_score}
-
-Kembalikan HANYA JSON valid dengan format:
-{{
-  "score": <angka 0 sampai {max_score}>,
-  "percentage": <angka 0-100>,
-  "feedback": "<umpan balik singkat dalam Bahasa Indonesia>",
-  "criteria": {{
-    "accuracy": <0-100>,
-    "completeness": <0-100>,
-    "clarity": <0-100>
-  }}
-}}
-
-Jangan tambahkan teks apapun di luar JSON."""
-
-        user_prompt = f"""Pertanyaan: {question}
-
-Kunci Jawaban: {reference_answer}
-
-Jawaban Siswa: {student_answer}"""
-
-        # Call Groq API
-        completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        # Gunakan Groq Vision (llama-4-scout atau meta-llama/llama-4-maverick)
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=512,
-            timeout=60
-        )
-
-        raw_response = completion.choices[0].message.content.strip()
-        logger.info(f"[grade_text] Groq response: {raw_response[:200]}")
-
-        # Parse JSON dari response
-        json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
-        if not json_match:
-            raise ValueError("Tidak ditemukan JSON dalam response AI")
-
-        result = json.loads(json_match.group())
-
-        # Validasi dan normalisasi
-        score      = min(max(float(result.get("score", 0)), 0), max_score)
-        percentage = min(max(float(result.get("percentage", 0)), 0), 100)
-        feedback   = str(result.get("feedback", ""))
-        criteria   = result.get("criteria", {})
-
-        return jsonify({
-            "success":    True,
-            "score":      round(score, 2),
-            "max_score":  max_score,
-            "percentage": round(percentage, 2),
-            "feedback":   feedback,
-            "criteria":   criteria
-        }), 200
-
-    except json.JSONDecodeError as e:
-        logger.error(f"[grade_text] JSON parse error: {e}")
-        return jsonify({"error": "Gagal parse response AI", "detail": str(e)}), 500
-
-    except Exception as e:
-        logger.error(f"[grade_text] Error: {e}")
-        return jsonify({"error": "Gagal memproses penilaian", "detail": str(e)}), 500
-
-
-# ── Batch Grading ─────────────────────────────────────────────────────────────
-@app.route("/api/grade-batch", methods=["POST"])
-@limiter.limit("3 per minute")
-def grade_batch():
-    try:
-        if not groq_client:
-            return jsonify({"error": "GROQ_API_KEY belum dikonfigurasi"}), 503
-
-        data = request.get_json(force=True)
-        items = data.get("items", [])
-
-        if not items:
-            return jsonify({"error": "Field 'items' wajib diisi dan tidak boleh kosong"}), 400
-
-        if len(items) > 10:
-            return jsonify({"error": "Maksimal 10 item per batch"}), 400
-
-        results = []
-        for item in items:
-            try:
-                question         = str(item.get("question", ""))
-                student_answer   = str(item.get("student_answer", ""))
-                reference_answer = str(item.get("reference_answer", ""))
-                max_score        = int(item.get("max_score", 10))
-
-                if not student_answer.strip():
-                    results.append({
-                        "success":    True,
-                        "score":      0,
-                        "max_score":  max_score,
-                        "percentage": 0,
-                        "feedback":   "Jawaban kosong."
-                    })
-                    continue
-
-                completion = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
+                {
+                    "role": "user",
+                    "content": [
                         {
-                            "role": "system",
-                            "content": f"Nilai jawaban siswa. Kembalikan JSON: {{\"score\": <0-{max_score}>, \"percentage\": <0-100>, \"feedback\": \"<string>\"}}"
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
                         },
                         {
-                            "role": "user",
-                            "content": f"Soal: {question}\nKunci: {reference_answer}\nJawaban: {student_answer}"
+                            "type": "text",
+                            "text": extraction_prompt
                         }
-                    ],
-                    temperature=0.1,
-                    max_tokens=256,
-                    timeout=60
-                )
-
-                raw = completion.choices[0].message.content.strip()
-                match = re.search(r'\{.*\}', raw, re.DOTALL)
-                parsed = json.loads(match.group()) if match else {}
-
-                results.append({
-                    "success":    True,
-                    "score":      min(max(float(parsed.get("score", 0)), 0), max_score),
-                    "max_score":  max_score,
-                    "percentage": min(max(float(parsed.get("percentage", 0)), 0), 100),
-                    "feedback":   str(parsed.get("feedback", ""))
-                })
-
-            except Exception as e:
-                logger.error(f"[grade_batch] Item error: {e}")
-                results.append({
-                    "success": False,
-                    "error":   str(e),
-                    "score":   0,
-                    "max_score": item.get("max_score", 10)
-                })
-
-        return jsonify({"success": True, "results": results}), 200
-
+                    ]
+                }
+            ],
+            temperature=0.1,  # Rendah untuk akurasi OCR
+            max_tokens=2000
+        )
+        
+        raw_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON dari response
+        # Bersihkan jika ada markdown code block
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0].strip()
+        
+        extracted_data = json.loads(raw_text)
+        
+        return jsonify({
+            "success": True,
+            "data": extracted_data,
+            "mode": mode
+        })
+        
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "success": False,
+            "error": "Gagal parse JSON dari AI",
+            "raw_response": raw_text if 'raw_text' in locals() else "",
+            "detail": str(e)
+        }), 500
     except Exception as e:
-        logger.error(f"[grade_batch] Error: {e}")
-        return jsonify({"error": "Gagal memproses batch", "detail": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# GRADE TEXT (AI Koreksi Isian & Esai)
+# ─────────────────────────────────────────
+@app.route("/api/grade-text", methods=["POST"])
+@limiter.limit("30 per minute")
+def grade_text():
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    question    = data.get("question", "")
+    student_ans = data.get("student_answer", "")
+    key_ans     = data.get("key_answer", "")
+    q_type      = data.get("type", "isian")  # isian | essay
+    max_score   = data.get("max_score", 10)
+    
+    if q_type == "essay":
+        system_prompt = f"""
+Kamu adalah guru pengoreksi esai yang adil dan teliti untuk sekolah di Indonesia.
+
+Koreksi jawaban esai siswa berdasarkan kunci jawaban/poin-poin yang harus ada.
+
+Soal: {question}
+Kunci Jawaban / Poin Penting: {key_ans}
+Jawaban Siswa: {student_ans}
+Skor Maksimal: {max_score}
+
+Berikan penilaian dalam format JSON:
+{{
+  "skor": <angka 0 sampai {max_score}>,
+  "persentase": <0-100>,
+  "komentar": "komentar konstruktif dalam bahasa Indonesia",
+  "kelebihan": "apa yang sudah benar dari jawaban siswa",
+  "kekurangan": "apa yang kurang atau salah",
+  "poin_terpenuhi": ["poin1", "poin2"],
+  "poin_kurang": ["poin3"]
+}}
+"""
+    else:  # isian singkat
+        system_prompt = f"""
+Kamu adalah guru pengoreksi isian singkat yang adil untuk sekolah di Indonesia.
+
+Koreksi jawaban isian singkat siswa. Toleransi typo kecil diperbolehkan.
+
+Soal: {question}
+Kunci Jawaban: {key_ans}
+Jawaban Siswa: {student_ans}
+Skor Maksimal: {max_score}
+
+Berikan penilaian dalam format JSON:
+{{
+  "skor": <angka 0 sampai {max_score}>,
+  "benar": <true atau false>,
+  "persentase": <0-100>,
+  "komentar": "komentar singkat dalam bahasa Indonesia",
+  "kunci_jawaban": "{key_ans}"
+}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": system_prompt}],
+            temperature=0.2,
+            max_tokens=800
+        )
+        
+        raw = response.choices[0].message.content.strip()
+        
+        if "```json" in raw:
+            raw = raw.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw:
+            raw = raw.split("```")[1].split("```")[0].strip()
+        
+        result = json.loads(raw)
+        return jsonify({"success": True, "result": result})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────
+# GRADE BATCH (Koreksi Banyak Soal Sekaligus)
+# ─────────────────────────────────────────
+@app.route("/api/grade-batch", methods=["POST"])
+@limiter.limit("20 per minute")
+def grade_batch():
+    data = request.get_json()
+    
+    if not data or "items" not in data:
+        return jsonify({"error": "Items array required"}), 400
+    
+    items = data["items"][:15]  # Max 15 soal
+    results = []
+    total_score = 0
+    max_total = 0
+    
+    for item in items:
+        q_type      = item.get("type", "isian")
+        question    = item.get("question", f"Soal nomor {item.get('number', '?')}")
+        student_ans = item.get("student_answer", "")
+        key_ans     = item.get("key_answer", "")
+        max_score   = item.get("max_score", 10)
+        number      = item.get("number", 0)
+        
+        if q_type == "pg":
+            # Koreksi PG langsung tanpa AI
+            benar = str(student_ans).strip().upper() == str(key_ans).strip().upper()
+            skor = max_score if benar else 0
+            results.append({
+                "number": number,
+                "type": "pg",
+                "student_answer": student_ans,
+                "key_answer": key_ans,
+                "benar": benar,
+                "skor": skor,
+                "max_score": max_score
+            })
+            total_score += skor
+            max_total += max_score
+            continue
+        
+        # Isian / Esai → pakai AI
+        if q_type == "essay":
+            prompt = f"""
+Koreksi jawaban esai. Soal: {question}
+Kunci: {key_ans}
+Jawaban Siswa: {student_ans}
+Skor Maks: {max_score}
+
+Output JSON: {{"skor": <angka>, "persentase": <0-100>, "komentar": "..."}}
+"""
+        else:
+            prompt = f"""
+Koreksi isian singkat. Soal: {question}
+Kunci: {key_ans}  
+Jawaban Siswa: {student_ans}
+Skor Maks: {max_score}
+
+Toleransi typo kecil. Output JSON: {{"skor": <angka>, "benar": <true/false>, "komentar": "..."}}
+"""
+        
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300
+            )
+            
+            raw = response.choices[0].message.content.strip()
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+            
+            graded = json.loads(raw)
+            graded["number"] = number
+            graded["type"] = q_type
+            graded["student_answer"] = student_ans
+            graded["key_answer"] = key_ans
+            graded["max_score"] = max_score
+            
+            results.append(graded)
+            total_score += graded.get("skor", 0)
+            max_total += max_score
+            
+        except Exception as e:
+            results.append({
+                "number": number,
+                "type": q_type,
+                "error": str(e),
+                "skor": 0,
+                "max_score": max_score
+            })
+            max_total += max_score
+    
+    final_percentage = (total_score / max_total * 100) if max_total > 0 else 0
+    
+    return jsonify({
+        "success": True,
+        "results": results,
+        "summary": {
+            "total_score": round(total_score, 2),
+            "max_total": max_total,
+            "percentage": round(final_percentage, 2),
+            "grade": get_grade(final_percentage)
+        }
+    })
+
+
+def get_grade(percentage):
+    if percentage >= 90: return "A"
+    elif percentage >= 80: return "B"
+    elif percentage >= 70: return "C"
+    elif percentage >= 60: return "D"
+    else: return "E"
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
